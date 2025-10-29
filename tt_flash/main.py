@@ -11,13 +11,22 @@ import os
 import json
 import sys
 import tarfile
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 import tt_flash
 from tt_flash import utility
 from tt_flash.error import TTError
-from tt_flash.utility import CConfig
-from tt_flash.flash import flash_chips
+from tt_flash.utility import (
+    CConfig,
+    install_no_interrupt_handler,
+    restore_sigint_handler,
+)
+from tt_flash.flash import (
+    flash_chip,
+    verify_package,
+    reset_all_devices
+)
 
 from .chip import detect_local_chips
 
@@ -277,18 +286,85 @@ def main():
             print(f"{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} DETECT")
             devices = detect_local_chips(ignore_ethernet=True)
 
+            print(f"\t{CConfig.COLOR.GREEN}Sub Stage:{CConfig.COLOR.ENDC} VERIFY")
+            if CConfig.is_tty():
+                print("\t\tVerifying fw-package can be flashed ", end="", flush=True)
+            else:
+                print("\t\tVerifying fw-package can be flashed")
+            manifest = verify_package(tar, version)
+
+            if CConfig.is_tty():
+                print(
+                    f"\r\t\tVerifying fw-package can be flashed: {CConfig.COLOR.GREEN}complete{CConfig.COLOR.ENDC}"
+                )
+            else:
+                print(
+                    f"\t\tVerifying fw-package can be flashed: {CConfig.COLOR.GREEN}complete{CConfig.COLOR.ENDC}"
+                )
+
             print(f"{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} FLASH")
 
-            return flash_chips(
-                config,
-                devices,
-                tar,
-                args.force,
-                args.no_reset,
-                version,
-                args.allow_major_downgrades,
-                skip_missing_fw=args.skip_missing_fw,
-            )
+            flash_chip_args = [
+                (dev, tar, manifest, args.force, args.allow_major_downgrades, args.skip_missing_fw)
+                for dev in devices
+            ]
+            
+            # Block Ctrl-C during flash operations
+            original_handler = install_no_interrupt_handler()
+            try:
+                with ThreadPool() as p:
+                    results = p.starmap(flash_chip, flash_chip_args)
+            finally:
+                restore_sigint_handler(original_handler)
+
+            # Unpack results from flash operation
+            needs_reset_wh = []
+            needs_reset_bh = []
+            rcs = []
+            m3_delays = []
+            boardnames = []
+            
+            for wh_interface_id, bh_interface_id, rc_val, m3_delay_val, boardname in results:
+                if wh_interface_id is not None:
+                    needs_reset_wh.append(wh_interface_id)
+                if bh_interface_id is not None:
+                    needs_reset_bh.append(bh_interface_id)
+                rcs.append(rc_val)
+                m3_delays.append(m3_delay_val)
+                boardnames.append(boardname)
+            
+            rc = any(rcs)
+            m3_delay = max(m3_delays) if m3_delays else 20
+
+            if rc != 0 and args.no_reset:
+                print(
+                    f"\t\tErrors detected during flash, would not have reset even if --no-reset was not given..."
+                )
+            elif args.no_reset:
+                print(
+                    f"\t\tWould have reset to force m3 recovery, but did not due to --no-reset"
+                )
+            elif rc != 0:
+                print(f"\t\tErrors detected during flash, skipping automatic reset...")
+            else:
+                devices = reset_all_devices(needs_reset_wh, needs_reset_bh, m3_delay, boardnames)
+
+            for idx, chip in enumerate(devices):
+                if manifest.bundle_version[0] >= 19 and isinstance(chip, BhChip):
+                    # Get a random number to send back as arg0
+                    check_val = random.randint(1, 0xFFFF)
+                    try:
+                        response = chip.arc_msg(chip.fw_defines["MSG_CONFIRM_FLASHED_SPI"], arg0=check_val)
+                    except BaseException:
+                        response = [0]
+                    if (response[0] & 0xFFFF) != check_val:
+                        print(f"{CConfig.COLOR.YELLOW}WARNING:{CConfig.COLOR.ENDC} Post flash check failed for chip {idx}")
+                        print("Try resetting the board to ensure the new firmware is loaded correctly.")
+
+            if rc == 0:
+                print(f"FLASH {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}")
+            else:
+                print(f"FLASH {CConfig.COLOR.RED}FAILED{CConfig.COLOR.ENDC}")
         else:
             raise TTError(f"No handler for command {args.command}.")
     except Exception as e:

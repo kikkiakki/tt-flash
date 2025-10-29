@@ -9,7 +9,6 @@ from datetime import date
 from enum import Enum, auto
 import json
 import requests
-import signal
 import tarfile
 import time
 from typing import Callable, Optional, Union
@@ -473,39 +472,23 @@ def flash_chip_stage2(
     chip: TTChip,
     data: FlashData,
 ) -> Optional[bool]:
-    # Install sigint handler
-    def signal_handler(sig, frame):
-        print("Ctrl-C Caught: this process should not be interrupted")
-
     def perform_write(chip, writes: FlashWrite):
-        original_sigint_handler = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, signal_handler)
-
-        try:
-            for write in writes:
-                chip.spi_write(write.offset, write.write)
-        finally:
-            signal.signal(signal.SIGINT, original_sigint_handler)
+        for write in writes:
+            chip.spi_write(write.offset, write.write)
 
     def perform_verify(chip, writes: FlashWrite) -> Optional[Union[int, int]]:
-        original_sigint_handler = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, signal_handler)
+        for write in writes:
+            base_data = chip.spi_read(write.offset, len(write.write))
 
-        try:
-            for write in writes:
-                base_data = chip.spi_read(write.offset, len(write.write))
-
-                if base_data != write.write:
-                    first_mismatch = None
-                    mismatch_count = 0
-                    for index, (a, b) in enumerate(zip(base_data, write.write)):
-                        if a != b:
-                            mismatch_count += 1
-                            if first_mismatch is None:
-                                first_mismatch = index
-                    return first_mismatch, mismatch_count
-        finally:
-            signal.signal(signal.SIGINT, original_sigint_handler)
+            if base_data != write.write:
+                first_mismatch = None
+                mismatch_count = 0
+                for index, (a, b) in enumerate(zip(base_data, write.write)):
+                    if a != b:
+                        mismatch_count += 1
+                        if first_mismatch is None:
+                            first_mismatch = index
+                return first_mismatch, mismatch_count
 
         return None
 
@@ -517,6 +500,8 @@ def flash_chip_stage2(
         )
     else:
         print("\t\t\tWriting new firmware... (this may take up to 1 minute)")
+
+    print(chip)
 
     perform_write(chip, data.write)
 
@@ -766,84 +751,62 @@ def glx_6u_trays_reset(reinit=True, ubb_num="0xF", dev_num="0xFF", op_mode="0x0"
     )
 
 
-def flash_chips(
-    sys_config: Optional[dict],
-    devices: list[TTChip],
+def flash_chip(
+    dev: TTChip,
     fw_package: tarfile.TarFile,
+    manifest: Manifest,
     force: bool,
-    no_reset: bool,
-    version: tuple[int, int, int],
     allow_major_downgrades: bool,
     skip_missing_fw: bool = False,
 ):
-    print(f"\t{CConfig.COLOR.GREEN}Sub Stage:{CConfig.COLOR.ENDC} VERIFY")
-    if CConfig.is_tty():
-        print("\t\tVerifying fw-package can be flashed ", end="", flush=True)
-    else:
-        print("\t\tVerifying fw-package can be flashed")
-    manifest = verify_package(fw_package, version)
+    print(
+        f"\t\tVerifying {CConfig.COLOR.BLUE}{dev}{CConfig.COLOR.ENDC} can be flashed"
+    )
+    try:
+        boardname = get_board_type(dev.board_type(), from_type=True)
+    except:
+        boardname = None
 
-    if CConfig.is_tty():
-        print(
-            f"\r\t\tVerifying fw-package can be flashed: {CConfig.COLOR.GREEN}complete{CConfig.COLOR.ENDC}"
-        )
-    else:
-        print(
-            f"\t\tVerifying fw-package can be flashed: {CConfig.COLOR.GREEN}complete{CConfig.COLOR.ENDC}"
-        )
+    if boardname is None:
+        raise TTError(f"Did not recognize board type for {dev}")
 
-    to_flash = []
-    for dev in devices:
-        print(
-            f"\t\tVerifying {CConfig.COLOR.BLUE}{dev}{CConfig.COLOR.ENDC} can be flashed"
-        )
-        try:
-            boardname = get_board_type(dev.board_type(), from_type=True)
-        except:
-            boardname = None
-
-        if boardname is None:
-            raise TTError(f"Did not recognize board type for {dev}")
-
-        # For p300 we need to check if its L or R chip
-        if "P300" in boardname:
-            # 0 = Right, 1 = Left
-            if dev.get_asic_location() == 0:
-                boardname = f"{boardname}_right"
-            elif dev.get_asic_location() == 1:
-                boardname = f"{boardname}_left"
-
-        to_flash.append(boardname)
+    # For p300 we need to check if its L or R chip
+    if "P300" in boardname:
+        # 0 = Right, 1 = Left
+        if dev.get_asic_location() == 0:
+            boardname = f"{boardname}_right"
+        elif dev.get_asic_location() == 1:
+            boardname = f"{boardname}_left"
 
     print(f"\t{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} FLASH")
 
     flash_data = []
     flash_error = []
-    needs_reset_wh = []
-    needs_reset_bh = []
-    for chip, boardname in zip(devices, to_flash):
-        print(
-            f"\t\t{CConfig.COLOR.GREEN}Sub Stage{CConfig.COLOR.ENDC} FLASH Step 1: {CConfig.COLOR.BLUE}{chip}{CConfig.COLOR.ENDC}"
-        )
-        result = flash_chip_stage1(
-            chip,
-            boardname,
-            manifest,
-            fw_package,
-            force,
-            allow_major_downgrades,
-            skip_missing_fw=skip_missing_fw,
-        )
+    wh_interface_to_reset = None
+    bh_interface_to_reset = None
 
-        if result.state == FlashStageResultState.Err:
-            flash_error.append(f"{chip}: {result.msg}")
-        elif result.state == FlashStageResultState.Ok:
-            flash_data.append((chip, result.data))
-            if result.can_reset:
-                if isinstance(chip, WhChip):
-                    needs_reset_wh.append(chip.interface_id)
-                elif isinstance(chip, BhChip):
-                    needs_reset_bh.append(chip.interface_id)
+    print(
+        f"\t\t{CConfig.COLOR.GREEN}Sub Stage{CConfig.COLOR.ENDC} FLASH Step 1: {CConfig.COLOR.BLUE}{dev}{CConfig.COLOR.ENDC}"
+    )
+    result = flash_chip_stage1(
+        dev,
+        boardname,
+        manifest,
+        fw_package,
+        force,
+        allow_major_downgrades,
+        skip_missing_fw=skip_missing_fw,
+    )
+
+    if result.state == FlashStageResultState.Err:
+        flash_error.append(f"{dev}: {result.msg}")
+    elif result.state == FlashStageResultState.Ok:
+        flash_data.append((dev, result.data))
+        if result.can_reset:
+            if isinstance(dev, WhChip):
+                wh_interface_to_reset = dev.interface_id
+            elif isinstance(dev, BhChip):
+                bh_interface_to_reset = dev.interface_id
 
     rc = 0
 
@@ -865,103 +828,44 @@ def flash_chips(
         )
         live_countdown(15.0, "\t\tRemote copy", print_initial=False)
 
+    # From here, return. needs_reset_wh/needs_reset_bh will be collected outside
+    # the thread and input to a reset method
+
+    m3_delay = 20 # M3 takes 20 seconds to boot and be ready after a reset
+    running_version = chip.get_bundle_version().running
+    if (running_version is None) or (running_version[0] != manifest.bundle_version[0]):
+        # We crossed a major version boundary, give a longer boot timeout
+        print(
+            "\t\tDetected update across major version, will wait 60 seconds for m3 to boot after reset"
+        )
+        m3_delay = 60
+
+    return (wh_interface_to_reset, bh_interface_to_reset, rc, m3_delay, boardname)
+
+def reset_all_devices(needs_reset_wh, needs_reset_bh, m3_delay, boardnames):
+
     if len(needs_reset_wh) > 0 or len(needs_reset_bh) > 0:
         print(f"{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} RESET")
+        # Reset boards if necessary
+        # All chips are on BH Galaxy UBB
+        if set(boardnames) == {"GALAXY-1"}:
+            glx_6u_trays_reset()
+            # All BH chips have now been reset
+            # Don't reset them conventionally
+            needs_reset_bh = []
 
-        m3_delay = 20 # M3 takes 20 seconds to boot and be ready after a reset
-        running_version = chip.get_bundle_version().running
-        if (running_version is None) or (running_version[0] != manifest.bundle_version[0]):
-            # We crossed a major version boundary, give a longer boot timeout
-            print(
-                "\t\tDetected update across major version, will wait 60 seconds for m3 to boot after reset"
+        if len(needs_reset_wh) > 0:
+            WHChipReset().full_lds_reset(
+                pci_interfaces=needs_reset_wh, reset_m3=True
             )
-            m3_delay = 60
 
-        if no_reset:
-            if rc != 0:
-                print(
-                    f"\t\tErrors detected during flash, would not have reset even if --no-reset was not given..."
-                )
-            else:
-                print(
-                    f"\t\tWould have reset to force m3 recovery, but did not due to --no-reset"
-                )
-        else:
-            if rc != 0:
-                print(f"\t\tErrors detected during flash, skipping automatic reset...")
-            else:
-                # Reset boards if necessary
-                mobo_dict_list = []
-                if sys_config is not None:
-                    for mobo_dict in sys_config.get("wh_mobo_reset", {}):
-                        # Only add the mobos that have a name
-                        if "mobo" in mobo_dict:
-                            if (
-                                "MOBO NAME" not in mobo_dict["mobo"]
-                                and mobo_dict["mobo"] in mobos
-                            ):
-                                mobo_dict_list.append(mobo_dict)
+        if len(needs_reset_bh) > 0:
+            BHChipReset().full_lds_reset(
+                pci_interfaces=needs_reset_bh, reset_m3=True,
+                m3_delay=m3_delay
+            )
 
-                    if len(mobo_dict_list) > 0:
-                        GalaxyReset().warm_reset_mobo(mobo_dict_list)
-                        # The mobo reset will also reset all nb cards connected to the mobo.
-                        # So we'll just remove them here to avoid setting them again
-                        wh_link_pci_indices = sys_config["wh_link_reset"]["pci_index"]
-                        for entry in mobo_dict_list:
-                            if (
-                                "nb_host_pci_idx" in entry.keys()
-                                and entry["nb_host_pci_idx"]
-                            ):
-                                # remove the list of WH PCIe index's from the reset list
-                                wh_link_pci_indices = list(
-                                    set(wh_link_pci_indices)
-                                    - set(entry["nb_host_pci_idx"])
-                                )
-                            sys_config["wh_link_reset"][
-                                "pci_index"
-                            ] = wh_link_pci_indices
-                        needs_reset_wh = [
-                            idx
-                            for idx in sys_config["wh_link_reset"]["pci_index"]
-                            if idx in needs_reset_wh
-                        ]
+        if len(needs_reset_wh) > 0 or len(needs_reset_bh) > 0:
+            devices = detect_chips()
 
-                # All chips are on BH Galaxy UBB
-                if set(to_flash) == {"GALAXY-1"}:
-                    glx_6u_trays_reset()
-                    # All BH chips have now been reset
-                    # Don't reset them conventionally
-                    needs_reset_bh = []
-
-                if len(needs_reset_wh) > 0:
-                    WHChipReset().full_lds_reset(
-                        pci_interfaces=needs_reset_wh, reset_m3=True
-                    )
-
-                if len(needs_reset_bh) > 0:
-                    BHChipReset().full_lds_reset(
-                        pci_interfaces=needs_reset_bh, reset_m3=True,
-                        m3_delay=m3_delay
-                    )
-
-                if len(needs_reset_wh) > 0 or len(needs_reset_bh) > 0:
-                    devices = detect_chips()
-
-    for idx, chip in enumerate(devices):
-        if manifest.bundle_version[0] >= 19 and isinstance(chip, BhChip):
-            # Get a random number to send back as arg0
-            check_val = random.randint(1, 0xFFFF)
-            try:
-                response = chip.arc_msg(chip.fw_defines["MSG_CONFIRM_FLASHED_SPI"], arg0=check_val)
-            except BaseException:
-                response = [0]
-            if (response[0] & 0xFFFF) != check_val:
-                print(f"{CConfig.COLOR.YELLOW}WARNING:{CConfig.COLOR.ENDC} Post flash check failed for chip {idx}")
-                print("Try resetting the board to ensure the new firmware is loaded correctly.")
-
-    if rc == 0:
-        print(f"FLASH {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}")
-    else:
-        print(f"FLASH {CConfig.COLOR.RED}FAILED{CConfig.COLOR.ENDC}")
-
-    return rc
+    return devices
