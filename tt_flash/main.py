@@ -11,8 +11,13 @@ import os
 import json
 import sys
 import tarfile
+import threading
+import time
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
+
+from rich.live import Live
+from rich.console import Console
 
 import tt_flash
 from tt_flash import utility
@@ -25,7 +30,8 @@ from tt_flash.utility import (
 from tt_flash.flash import (
     flash_chip,
     verify_package,
-    reset_all_devices
+    reset_all_devices,
+    FlashStatusTracker,
 )
 
 from .chip import detect_local_chips
@@ -303,19 +309,27 @@ def main():
                 )
 
             print(f"{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} FLASH")
+            print()  # Blank line before table
 
-            flash_chip_args = [
-                (dev, tar, manifest, args.force, args.allow_major_downgrades, args.skip_missing_fw)
-                for dev in devices
-            ]
+            # Create status tracker with chip IDs
+            chip_ids = [str(dev) for dev in devices]
+            status_tracker = FlashStatusTracker(chip_ids)
             
-            # Block Ctrl-C during flash operations
+            # Block Ctrl-C and run with live table updates
             original_handler = install_no_interrupt_handler()
             try:
-                with ThreadPool() as p:
-                    results = p.starmap(flash_chip, flash_chip_args)
+                with Live(status_tracker, refresh_per_second=4, console=Console()) as live:
+                    # Run flash operations
+                    flash_chip_args = [
+                        (dev, tar, manifest, status_tracker, args.force, args.allow_major_downgrades, args.skip_missing_fw)
+                        for dev in devices
+                    ]
+                    with ThreadPool() as p:
+                        results = p.starmap(flash_chip, flash_chip_args)
             finally:
                 restore_sigint_handler(original_handler)
+
+            print()  # Blank line after table
 
             # Unpack results from flash operation
             needs_reset_wh = []
@@ -347,7 +361,9 @@ def main():
             elif rc != 0:
                 print(f"\t\tErrors detected during flash, skipping automatic reset...")
             else:
-                devices = reset_all_devices(needs_reset_wh, needs_reset_bh, m3_delay, boardnames)
+                reset_devices = reset_all_devices(needs_reset_wh, needs_reset_bh, m3_delay, boardnames)
+                if reset_devices is not None:
+                    devices = reset_devices
 
             for idx, chip in enumerate(devices):
                 if manifest.bundle_version[0] >= 19 and isinstance(chip, BhChip):
