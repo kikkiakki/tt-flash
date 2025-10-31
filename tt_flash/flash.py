@@ -3,17 +3,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from base64 import b16decode
 from datetime import date
 from enum import Enum, auto
 import json
 import requests
 import tarfile
+import threading
 import time
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List, Dict
 import sys
 import random
+from tqdm import tqdm
+
+from rich.console import Console
+from rich.table import Table
 
 import tt_flash
 from tt_flash.blackhole import boot_fs_write
@@ -175,11 +180,104 @@ class FlashStageResult:
     data: Optional[FlashData]
 
 
+@dataclass
+class FlashReturnVal:
+    needs_reset_wh: str
+    needs_reset_bh: str
+    boardname: str
+    m3_delay: int
+    rc: int
+
+
+@dataclass
+class FlashDebugInfo:
+    progress: int = 0 # Progress must be <= 100
+    debug_messages: List[str] = field(default_factory=list)
+    version_rom: str = ""
+    version_flash: str = ""
+    was_updated: bool = False
+
+
+class FlashStatusTracker:
+    """
+    Thread-safe flash status tracker. Keeps track of debug message history and
+    current flash progress percentage for each chip.
+    """
+    
+    def __init__(self, chip_ids: List[str]):
+        self.lock = threading.Lock()
+        self.pbar = tqdm(total=100)
+        self.flash_debug_info: Dict[str, FlashDebugInfo] = {chip_id: FlashDebugInfo() for chip_id in chip_ids}
+
+    def append_debug_message(self, chip_id: str, status: str, progress: int = None):
+        """
+        Update status and progress data in a specific chip's FlashStatus.
+        """
+        with self.lock:
+            debug_info = self.flash_debug_info[chip_id]
+            debug_info.debug_messages.append(status)
+            if progress is not None:
+                debug_info.progress = progress
+        if progress is not None:
+            self.update_flash_progress_bar()
+
+    def update_flash_progress_bar(self):
+        """
+        Normalize progress across number of chips and add them up
+        to calculate the current flash progress percentage out of 100.
+
+        Updates tqdm progress bar.
+        """
+        with self.lock:
+            progresses = [debug_info.progress for debug_info in self.flash_debug_info.values()]
+            total_progress = sum(progresses) / len(progresses)
+            delta = total_progress - self.pbar.n
+            if delta > 0:
+                self.pbar.update(delta)
+
+    def set_versions(self, chip_id: str, version_rom: str = None, version_flash: str = None):
+        """
+        """
+        with self.lock:
+            if version_rom is not None:
+                self.flash_debug_info[chip_id].version_rom = version_rom
+            if version_flash is not None:
+                self.flash_debug_info[chip_id].version_flash = version_flash
+
+    def set_updated(self, chip_id: str):
+        """
+        """
+        with self.lock:
+            self.flash_debug_info[chip_id].was_updated = True
+
+    def print_flash_results_table(self):
+        """
+        Generate Rich table of each chip with flash results, including the FW version that was
+        previously in ROM, the FW version flashed, and whether or not it was updated.
+        """
+        table = Table(title="Flash Summary")
+
+        table.add_column("Chip", no_wrap=True)
+        table.add_column("ROM Version")
+        table.add_column("Flash Version")
+        table.add_column("Was Updated?")
+
+        for chip_id, debug_info in self.flash_debug_info.items():
+            table.add_row(chip_id, debug_info.version_rom, debug_info.version_flash, str(debug_info.was_updated))
+
+        console = Console()
+        console.print(table)
+
+    def generate_debug_log(self):
+        pass
+
+
 def flash_chip_stage1(
     chip: TTChip,
     boardname: str,
     manifest: Manifest,
     fw_package: tarfile.TarFile,
+    status_tracker: FlashStatusTracker,
     force: bool,
     allow_major_downgrades: bool,
     skip_missing_fw: bool = False,
@@ -187,7 +285,7 @@ def flash_chip_stage1(
     """
     Check the chip and determine if it is a candidate to be flashed.
 
-    The possible outcomes for this function are
+    The possible outcomes for this function are:
     1. The chip is running old fw and can be flashed
     2. The chip is running fw too old to get the status from
         a. Force was used, so it will get flashed
@@ -195,6 +293,14 @@ def flash_chip_stage1(
     3. The chip is running up to date fw, so we don't flash it
     4. Force was used so we flash the fw no matter what
     """
+    def append_debug_message(message: str, progress: int = None):
+        if status_tracker:
+            status_tracker.append_debug_message(str(chip), message, progress)
+
+
+    def set_versions(version_rom: str = None, version_flash: str = None):
+        if status_tracker:
+            status_tracker.set_versions(str(chip), version_rom, version_flash)
 
     try:
         chip.arc_msg(
@@ -211,12 +317,12 @@ def flash_chip_stage1(
             # Very old gs/wh fw doesn't have support for getting the fw version at all
             # so it's safe to assume that we need to update
             if force:
-                print(
-                    f"\t\t\tHit error {fw_bundle_version.exception} while trying to determine running firmware. Falling back to assuming that it needs an update"
+                append_debug_message(
+                    f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. Falling back to assuming that it needs an update",
                 )
             else:
                 raise TTError(
-                    f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. If you know what you are doing you may still update by re-rerunning using the --force flag."
+                    f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. If you know what you are doing you may still update by rerunning using the --force flag."
                 )
         else:
             # BH must always successfully be able to return a fw_version
@@ -229,21 +335,22 @@ def flash_chip_stage1(
         # Certain old fw versions won't have the running_bundle_version populated.
         # In that case we can just assume that an upgrade is required.
         if force:
-            print(
-                "\t\t\tLooks like you are running a very old set of fw, assuming that it needs an update"
+            append_debug_message(
+                "Looks like you are running a very old set of fw, assuming that it needs an update",
             )
         else:
             raise TTError(
                 "Looks like you are running a very old set of fw, it's safe to assume that it needs an update but please update it using --force"
             )
-        print(f"\t\t\tNow flashing tt-flash version: {manifest.bundle_version}")
+        append_debug_message(f"Now flashing tt-flash version: {manifest.bundle_version}", progress=10)
     else:
         component = fw_bundle_version.running[0]
         if component > manifest.bundle_version[0]:
             if allow_major_downgrades:
-                print(
-                    f"\t\t\tDetected major version downgrade from {fw_bundle_version.running} to {manifest.bundle_version}, "
-                    "but major downgrades are allowed so we are proceeding"
+                append_debug_message(
+                    f"Detected major version downgrade from {fw_bundle_version.running} to {manifest.bundle_version}, "
+                    "but major downgrades are allowed so we are proceeding",
+                    progress=10
                 )
             else:
                 raise TTError(
@@ -252,14 +359,16 @@ def flash_chip_stage1(
                 )
         if component == manifest.bundle_version[0] - 1:
             # Permit updates across only one major version boundary
-            print(
-                f"\t\t\t{CConfig.COLOR.YELLOW}Detected major version upgrade from "
-                f"{fw_bundle_version.running} to {manifest.bundle_version}{CConfig.COLOR.ENDC}"
+            append_debug_message(
+                f"{CConfig.COLOR.YELLOW}Detected major version upgrade from "
+                f"{fw_bundle_version.running} to {manifest.bundle_version}{CConfig.COLOR.ENDC}",
+                progress=10
             )
         elif component != manifest.bundle_version[0]:
             if force:
-                print(
-                    f"\t\t\tFound unexpected bundle version ('{component}'), however you ran with force so we are barreling onwards"
+                append_debug_message(
+                    f"Found unexpected bundle version ('{component}'), however you ran with force so we are barreling onwards",
+                    progress=10
                 )
             else:
                 raise TTError(
@@ -267,29 +376,34 @@ def flash_chip_stage1(
                     "bypass with --force"
                 )
 
-        print(
-            f"\t\t\tROM version is: {fw_bundle_version.running}. tt-flash version is: {manifest.bundle_version}"
+        append_debug_message(
+            f"ROM version is: {fw_bundle_version.running}. tt-flash version is: {manifest.bundle_version}",
+            progress=10
         )
 
     detected_version = True
     if force:
         detected_version = False
-        print("\t\t\tForced ROM update requested. ROM will now be updated.")
+        append_debug_message("Forced ROM update requested. ROM will now be updated.")
+        # TODO: Get versions here and run set_versions(...)
     # Best check is for if we have already flashed the desired fw (or newer fw) to spi
     elif fw_bundle_version.spi is not None:
         if fw_bundle_version.spi >= manifest.bundle_version:
             # Now that we know if the SPI is newer we should check to see if the problem is that we have flashed the correct FW, but are running something too old
             if fw_bundle_version.running is not None:
                 if fw_bundle_version.running >= manifest.bundle_version:
-                    print("\t\t\tROM does not need to be updated.")
-                if fw_bundle_version.running < manifest.bundle_version:
-                    print(
-                        "\t\t\tROM does not need to be updated, while the chip is running old FW the SPI is up to date. You can load the new firmware after a reboot, or in the case of WH a reset. Or skip this check with --force."
+                    append_debug_message("ROM does not need to be updated.")
+                    set_versions(str(fw_bundle_version.running), str(manifest.bundle_version))
+                elif fw_bundle_version.running < manifest.bundle_version:
+                    append_debug_message(
+                        "ROM does not need to be updated, while the chip is running old FW the SPI is up to date. You can load the new firmware after a reboot, or in the case of WH a reset. Or skip this check with --force."
                     )
+                    set_versions(str(fw_bundle_version.spi), "N/A")
             else:
-                print(
-                    "\t\t\tROM does not need to be updated, cannot detect the running FW version but the SPI is ahead of the firmware you are attempting to flash. You can load the newer firmware after a reboot, or in the case of WH a reset. Or skip this check with --force."
+                append_debug_message(
+                    "ROM does not need to be updated, cannot detect the running FW version but the SPI is ahead of the firmware you are attempting to flash. You can load the newer firmware after a reboot, or in the case of WH a reset. Or skip this check with --force."
                 )
+                set_versions(str(fw_bundle_version.spi), "N/A")
 
             return FlashStageResult(
                 state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False
@@ -297,18 +411,22 @@ def flash_chip_stage1(
     # We did not see any spi versions returned... just go by running
     elif fw_bundle_version.running is not None:
         if fw_bundle_version.running >= manifest.bundle_version:
-            print("\t\t\tROM does not need to be updated.")
+            append_debug_message("ROM does not need to be updated.")
+            set_versions(str(fw_bundle_version.running), str(manifest.bundle_version))
             return FlashStageResult(
                 state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False
             )
     else:
         detected_version = False
-        print(
-            "\t\t\tWas not able to fetch current firmware information, assuming that it needs an update"
+        append_debug_message(
+            "Was not able to fetch current firmware information, assuming that it needs an update",
+            progress=15
         )
+        set_versions("N/A", str(manifest.bundle_version))
 
     if detected_version:
-        print("\t\t\tFW bundle version > ROM version. ROM will now be updated.")
+        append_debug_message("FW bundle version > ROM version. ROM will now be updated.", progress=15)
+        set_versions(str(chip), fw_bundle_version.running, manifest.bundle_version)
 
     try:
         image = fw_package.extractfile(f"./{boardname}/image.bin")
@@ -324,8 +442,8 @@ def flash_chip_stage1(
     boardname_to_display = change_to_public_name(boardname)
     if image is None and mask is None:
         if skip_missing_fw:
-            print(
-                f"\t\t\tCould not find flash data for {boardname_to_display} in tarfile"
+            append_debug_message(
+                f"Could not find flash data for {boardname_to_display} in tarfile"
             )
             return FlashStageResult(
                 state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False
@@ -435,8 +553,9 @@ def flash_chip_stage1(
 
 
     if boardname in ["NEBULA_X1", "NEBULA_X2"]:
-        print(
-            "\t\t\tBoard will require reset to complete update, checking if an automatic reset is possible"
+        append_debug_message(
+            "Board will require reset to complete update, checking if an automatic reset is possible",
+            progress=20
         )
         can_reset = False
 
@@ -447,12 +566,12 @@ def flash_chip_stage1(
                 and chip.smbus_fw_version() >= (2, 0xC, 0, 0)
             )
             if can_reset:
-                print(
-                    f"\t\t\t\t{CConfig.COLOR.GREEN}Success:{CConfig.COLOR.ENDC} Board can be auto reset; will be triggered if the flash is successful"
+                append_debug_message(
+                    f"{CConfig.COLOR.GREEN}Success:{CConfig.COLOR.ENDC} Board can be auto reset; will be triggered if the flash is successful"
                 )
         except Exception as e:
-            print(
-                f"\t\t\t\t{CConfig.COLOR.YELLOW}Fail:{CConfig.COLOR.ENDC} Board cannot be auto reset: Failed to get the current firmware versions. This won't stop the flash, but will require manual reset"
+            append_debug_message(
+                f"{CConfig.COLOR.YELLOW}Fail:{CConfig.COLOR.ENDC} Board cannot be auto reset: Failed to get the current firmware versions. This won't stop the flash, but will require manual reset"
             )
             can_reset = False
     elif isinstance(chip, BhChip):
@@ -471,6 +590,7 @@ def flash_chip_stage1(
 def flash_chip_stage2(
     chip: TTChip,
     data: FlashData,
+    status_tracker: FlashStatusTracker
 ) -> Optional[bool]:
     def perform_write(chip, writes: FlashWrite):
         for write in writes:
@@ -492,100 +612,76 @@ def flash_chip_stage2(
 
         return None
 
-    if CConfig.is_tty():
-        print(
-            "\t\t\tWriting new firmware... (this may take up to 1 minute)",
-            end="",
-            flush=True,
-        )
-    else:
-        print("\t\t\tWriting new firmware... (this may take up to 1 minute)")
+    def append_debug_message(message: str, progress: int = None):
+        if status_tracker:
+            status_tracker.append_debug_message(str(chip), message, progress)
 
-    print(chip)
+    def set_updated():
+        if status_tracker:
+            status_tracker.set_updated(str(chip))
+
+    append_debug_message("Writing new firmware... (this may take up to 1 minute)", progress=25)
 
     perform_write(chip, data.write)
 
-    if CConfig.is_tty():
-        print("\r\033[K", end="")
-    print(
-        f"\t\t\tWriting new firmware... {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}"
+    append_debug_message(
+        f"Writing new firmware... {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}",
+        progress=65
     )
 
-    print(
-        "\t\t\tVerifying flashed firmware... (this may also take up to 1 minute)",
-        end="",
-        flush=True,
-    )
-    if not CConfig.is_tty():
-        print()
+    append_debug_message("Verifying flashed firmware... (this may also take up to 1 minute)")
 
     verify_result = perform_verify(chip, data.write)
     if verify_result is not None:
         (first_mismatch, mismatch_count) = verify_result
 
-        if CConfig.is_tty():
-            print(f"\r\033[K", end="")
-        print(
-            f"\t\t\tIntial verification: {CConfig.COLOR.RED}failed{CConfig.COLOR.ENDC}"
+        append_debug_message(
+            f"Intial verification: {CConfig.COLOR.RED}failed{CConfig.COLOR.ENDC}"
         )
-        print(f"\t\t\t\tFirst Mismatch at: {first_mismatch}")
-        print(f"\t\t\t\tFound {mismatch_count} mismatches")
+        append_debug_message(f"First Mismatch at: {first_mismatch}")
+        append_debug_message(f"Found {mismatch_count} mismatches")
 
-        if CConfig.is_tty():
-            print(
-                "\t\t\tAttempted to write firmware one more time... (this, again, may also take up to 1 minute)",
-                end="",
-                flush=True,
-            )
-        else:
-            print(
-                "\t\t\tAttempted to write firmware one more time... (this, again, may also take up to 1 minute)"
-            )
+        append_debug_message(
+            "Attempted to write firmware one more time... (this, again, may also take up to 1 minute)"
+        )
 
         perform_write(chip, data.write)
 
-        if CConfig.is_tty():
-            print("\r\033[K", end="")
-        print(
-            f"\t\t\tAttempted to write firmware one more time... {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}"
+        append_debug_message(
+            f"Attempted to write firmware one more time... {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}",
+            progress=75
         )
 
-        print(
-            "\t\t\tVerifying second flash attempt... (this may also take up to 1 minute)",
-            end="",
-            flush=True,
+        append_debug_message(
+            "Verifying second flash attempt... (this may also take up to 1 minute)"
         )
-        if not CConfig.is_tty():
-            print()
 
         verify_result = perform_verify(chip, data.write)
         if verify_result is not None:
             (first_mismatch, mismatch_count) = verify_result
 
-            if CConfig.is_tty():
-                print(f"\r\033[K", end="")
-            print(
-                f"\t\t\tSecond verification {CConfig.COLOR.RED}failed{CConfig.COLOR.ENDC}, please do not reset or poweroff the board and contact support for further assistance."
+            append_debug_message(
+                f"Second verification {CConfig.COLOR.RED}failed{CConfig.COLOR.ENDC}, please do not reset or poweroff the board and contact support for further assistance."
             )
 
-            print(f"\t\t\t\tFirst Mismatch at: {first_mismatch}")
-            print(f"\t\t\t\tFound {mismatch_count} mismatches")
+            append_debug_message(f"First Mismatch at: {first_mismatch}")
+            append_debug_message(f"Found {mismatch_count} mismatches")
             return None
 
-    if CConfig.is_tty():
-        print(f"\r\033[K", end="")
-    print(
-        f"\t\t\tFirmware verification... {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}"
+    append_debug_message(
+        f"Firmware verification... {CConfig.COLOR.GREEN}SUCCESS{CConfig.COLOR.ENDC}",
+        progress=80
     )
+    set_updated()
 
     trigged_copy = False
     if data.idname == "NEBULA_X2":
-        print("\t\t\tInitiating local to remote data copy")
+        append_debug_message("Initiating local to remote data copy")
 
         # There is a bug in m3 app version 5.8.0.1 where we can trigger a boot loop during the left to right copy.
         # In this condition we will disable the auto-reset before triggering the left to right copy.
         if chip.m3_fw_app_version() == (5, 8, 0, 1):
-            print("Mitigating bootloop bug")
+            append_debug_message("Mitigating bootloop bug")
             triggered_reset_disable = False
             try:
                 chip.arc_msg(
@@ -593,19 +689,19 @@ def flash_chip_stage2(
                 )
                 triggered_reset_disable = True
             except Exception as e:
-                print(
-                    f"\t\t\t{CConfig.COLOR.BLUE}NOTE:{CConfig.COLOR.ENDC} Failed to disable the m3 autoreset; please reboot/reset your system and flash again to initiate the left to right copy."
+                append_debug_message(
+                    f"{CConfig.COLOR.BLUE}NOTE:{CConfig.COLOR.ENDC} Failed to disable the m3 autoreset; please reboot/reset your system and flash again to initiate the left to right copy."
                 )
                 return None
             if triggered_reset_disable:
-                live_countdown(1.0, "\t\t\tDisable m3 reset")
+                live_countdown(1.0, "Disable m3 reset")
 
         try:
             chip.arc_msg(chip.fw_defines["MSG_TRIGGER_SPI_COPY_LtoR"])
             trigged_copy = True
         except Exception as e:
-            print(
-                f"\t\t\t{CConfig.COLOR.BLUE}NOTE:{CConfig.COLOR.ENDC} Failed to initiate left to right copy; please reset the host to reset the board and then rerun the flash with the --force flag to complete flash."
+            append_debug_message(
+                f"{CConfig.COLOR.BLUE}NOTE:{CConfig.COLOR.ENDC} Failed to initiate left to right copy; please reset the host to reset the board and then rerun the flash with the --force flag to complete flash."
             )
             return None
 
@@ -755,12 +851,18 @@ def flash_chip(
     dev: TTChip,
     fw_package: tarfile.TarFile,
     manifest: Manifest,
+    status_tracker: FlashStatusTracker,
     force: bool,
     allow_major_downgrades: bool,
     skip_missing_fw: bool = False,
 ):
-    print(
-        f"\t\tVerifying {CConfig.COLOR.BLUE}{dev}{CConfig.COLOR.ENDC} can be flashed"
+    def append_debug_message(message: str, progress: int = None):
+        if status_tracker:
+            status_tracker.append_debug_message(str(dev), message, progress)
+
+    append_debug_message(
+        f"Verifying {dev} can be flashed",
+        progress=5
     )
     try:
         boardname = get_board_type(dev.board_type(), from_type=True)
@@ -778,21 +880,22 @@ def flash_chip(
         elif dev.get_asic_location() == 1:
             boardname = f"{boardname}_left"
 
-    print(f"\t{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} FLASH")
+    append_debug_message(f"{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} FLASH")
 
     flash_data = []
     flash_error = []
     wh_interface_to_reset = None
     bh_interface_to_reset = None
 
-    print(
-        f"\t\t{CConfig.COLOR.GREEN}Sub Stage{CConfig.COLOR.ENDC} FLASH Step 1: {CConfig.COLOR.BLUE}{dev}{CConfig.COLOR.ENDC}"
+    append_debug_message(
+        f"{CConfig.COLOR.GREEN}Sub Stage{CConfig.COLOR.ENDC} FLASH Step 1: {CConfig.COLOR.BLUE}{dev}{CConfig.COLOR.ENDC}"
     )
     result = flash_chip_stage1(
         dev,
         boardname,
         manifest,
         fw_package,
+        status_tracker,
         force,
         allow_major_downgrades,
         skip_missing_fw=skip_missing_fw,
@@ -812,10 +915,10 @@ def flash_chip(
 
     triggered_copy = False
     for chip, data in flash_data:
-        print(
-            f"\t\t{CConfig.COLOR.GREEN}Sub Stage{CConfig.COLOR.ENDC} FLASH Step 2: {CConfig.COLOR.BLUE}{chip} {{{data.name}}}{CConfig.COLOR.ENDC}"
+        append_debug_message(
+            f"{CConfig.COLOR.GREEN}Sub Stage{CConfig.COLOR.ENDC} FLASH Step 2: {CConfig.COLOR.BLUE}{chip} {{{data.name}}}{CConfig.COLOR.ENDC}"
         )
-        result = flash_chip_stage2(chip, data)
+        result = flash_chip_stage2(chip, data, status_tracker)
         if result is None:
             rc += 1
         else:
@@ -823,26 +926,30 @@ def flash_chip(
 
     # If we flashed an X2 then we will wait for the copy to complete
     if triggered_copy:
-        print(
-            f"\t\tFlash and verification for all chips completed, will now wait for n300 remote copy to complete..."
+        append_debug_message(
+            f"Flash and verification for all chips completed, will now wait for n300 remote copy to complete...",
+            progress=90
         )
-        live_countdown(15.0, "\t\tRemote copy", print_initial=False)
 
     # From here, return. needs_reset_wh/needs_reset_bh will be collected outside
     # the thread and input to a reset method
 
     m3_delay = 20 # M3 takes 20 seconds to boot and be ready after a reset
-    running_version = chip.get_bundle_version().running
+    running_version = dev.get_bundle_version().running
     if (running_version is None) or (running_version[0] != manifest.bundle_version[0]):
         # We crossed a major version boundary, give a longer boot timeout
-        print(
-            "\t\tDetected update across major version, will wait 60 seconds for m3 to boot after reset"
+        append_debug_message(
+            "Detected update across major version, will wait 60 seconds for m3 to boot after reset",
+            progress=90
         )
         m3_delay = 60
+
+    append_debug_message(f"{CConfig.COLOR.GREEN}✓ COMPLETE{CConfig.COLOR.ENDC}", progress=100)
 
     return (wh_interface_to_reset, bh_interface_to_reset, rc, m3_delay, boardname)
 
 def reset_all_devices(needs_reset_wh, needs_reset_bh, m3_delay, boardnames):
+    devices = None
 
     if len(needs_reset_wh) > 0 or len(needs_reset_bh) > 0:
         print(f"{CConfig.COLOR.GREEN}Stage:{CConfig.COLOR.ENDC} RESET")
