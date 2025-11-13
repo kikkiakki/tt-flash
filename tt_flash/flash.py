@@ -181,7 +181,7 @@ class FlashStageResult:
 
 
 @dataclass
-class FlashReturnVal:
+class FlashResult:
     needs_reset_wh: str
     needs_reset_bh: str
     boardname: str
@@ -193,8 +193,8 @@ class FlashReturnVal:
 class FlashDebugInfo:
     progress: int = 0 # Progress must be <= 100
     debug_messages: List[str] = field(default_factory=list)
-    version_rom: str = ""
-    version_flash: str = ""
+    version_previous: str = "N/A"
+    version_updated: str = "N/A"
     was_updated: bool = False
 
 
@@ -211,7 +211,7 @@ class FlashStatusTracker:
 
     def append_debug_message(self, chip_id: str, status: str, progress: int = None):
         """
-        Update status and progress data in a specific chip's FlashStatus.
+        Update status and progress data in a specific chip's FlashDebugInfo.
         """
         with self.lock:
             debug_info = self.flash_debug_info[chip_id]
@@ -235,17 +235,24 @@ class FlashStatusTracker:
             if delta > 0:
                 self.pbar.update(delta)
 
-    def set_versions(self, chip_id: str, version_rom: str = None, version_flash: str = None):
+    def set_previous_version(self, chip_id: str, version_previous: str):
         """
+        Set the detected previous version (either from ROM or running) in the chip's FlashDebugInfo.
         """
         with self.lock:
-            if version_rom is not None:
-                self.flash_debug_info[chip_id].version_rom = version_rom
-            if version_flash is not None:
-                self.flash_debug_info[chip_id].version_flash = version_flash
+            self.flash_debug_info[chip_id].version_previous = version_previous
+
+
+    def set_updated_version(self, chip_id: str, version_updated: str):
+        """
+        Set the updated version (from bundle manifest) in the chip's FlashDebugInfo.
+        """
+        with self.lock:
+            self.flash_debug_info[chip_id].version_updated = version_updated
 
     def set_updated(self, chip_id: str):
         """
+        Mark a chip as having been updated successfully in its FlashDebugInfo.
         """
         with self.lock:
             self.flash_debug_info[chip_id].was_updated = True
@@ -258,17 +265,18 @@ class FlashStatusTracker:
         table = Table(title="Flash Summary")
 
         table.add_column("Chip", no_wrap=True)
-        table.add_column("ROM Version")
-        table.add_column("Flash Version")
-        table.add_column("Was Updated?")
+        table.add_column("Previous Version")
+        table.add_column("Updated Version")
+        table.add_column("Did Update Occur?") # TODO: Print reason in this table. Either skip_flash reason or error.
 
         for chip_id, debug_info in self.flash_debug_info.items():
-            table.add_row(chip_id, debug_info.version_rom, debug_info.version_flash, str(debug_info.was_updated))
+            table.add_row(chip_id, debug_info.version_previous, debug_info.version_updated, str(debug_info.was_updated))
 
         console = Console()
         console.print(table)
 
     def generate_debug_log(self):
+        # TODO
         pass
 
 
@@ -286,148 +294,134 @@ def flash_chip_stage1(
     Check the chip and determine if it is a candidate to be flashed.
 
     The possible outcomes for this function are:
-    1. The chip is running old fw and can be flashed
-    2. The chip is running fw too old to get the status from
-        a. Force was used, so it will get flashed
-        b. Force was not used, return an error and don't continue the flash process
-    3. The chip is running up to date fw, so we don't flash it
-    4. Force was used so we flash the fw no matter what
+    1. The chip is running old FW and can be flashed.
+    2. The chip is running FW too old to get the status from, and either:
+        a. Force was used, so it will get flashed.
+        b. Force was not used, so an error is returned and the flash process is stopped.
+    3. The chip is running up-to-date FW or getting downgraded, so it doesn't get flashed.
+    4. Force was used, so we flash the FW no matter what.
     """
     def append_debug_message(message: str, progress: int = None):
-        if status_tracker:
-            status_tracker.append_debug_message(str(chip), message, progress)
+        """Helper to append debug messages to the chip's debug info"""
+        status_tracker.append_debug_message(str(chip), message, progress)
 
-
-    def set_versions(version_rom: str = None, version_flash: str = None):
-        if status_tracker:
-            status_tracker.set_versions(str(chip), version_rom, version_flash)
+    def skip_flash(reason: str):
+        """
+        Helper to skip flash (return NoFlash result) if necessary and
+        update the chip's debug info.
+        """
+        append_debug_message(reason)
+        return FlashStageResult(state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False)
 
     try:
-        chip.arc_msg(
-            chip.fw_defines["MSG_TYPE_ARC_STATE3"], wait_for_done=True, timeout=0.1
-        )
-    except Exception as err:
-        # Ok to keep going if there's a timeout
-        pass
+        chip.arc_msg(chip.fw_defines["MSG_TYPE_ARC_STATE3"], wait_for_done=True, timeout=0.1)
+    except Exception:
+        pass  # Ok to keep going if there's a timeout
 
+    # Get current firmware bundle version from chip
     fw_bundle_version = chip.get_bundle_version()
 
+    # Handle errors getting firmware version
     if fw_bundle_version.exception is not None:
         if fw_bundle_version.allow_exception:
-            # Very old gs/wh fw doesn't have support for getting the fw version at all
+            # Very old GS/WH FW doesn't have support for getting the FW version at all
             # so it's safe to assume that we need to update
-            if force:
-                append_debug_message(
-                    f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. Falling back to assuming that it needs an update",
-                )
-            else:
+            if not force:
                 raise TTError(
-                    f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. If you know what you are doing you may still update by rerunning using the --force flag."
+                    f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. "
+                    "If you know what you are doing you may still update by rerunning using the --force flag."
                 )
+            append_debug_message(
+                f"Hit error {fw_bundle_version.exception} while trying to determine running firmware. "
+                "Falling back to assuming that it needs an update"
+            )
         else:
             # BH must always successfully be able to return a fw_version
-            raise TTError(
-                f"Hit error {fw_bundle_version.exception} while trying to determine running firmware."
-            )
+            raise TTError(f"Hit error {fw_bundle_version.exception} while trying to determine running firmware.")
 
-    bundle_version = None
-    if fw_bundle_version.running is None:
+    running_version = fw_bundle_version.running
+    manifest_version = manifest.bundle_version
+
+    # 1. Check major version compatability
+    # TODO: Why do we check running version and not SPI version here?
+    if running_version is None:
         # Certain old fw versions won't have the running_bundle_version populated.
         # In that case we can just assume that an upgrade is required.
-        if force:
-            append_debug_message(
-                "Looks like you are running a very old set of fw, assuming that it needs an update",
-            )
-        else:
+        if not force:
             raise TTError(
-                "Looks like you are running a very old set of fw, it's safe to assume that it needs an update but please update it using --force"
+                "Looks like you are running a very old set of fw, it's safe to assume that it needs an update "
+                "but please update it using --force"
             )
-        append_debug_message(f"Now flashing tt-flash version: {manifest.bundle_version}", progress=10)
+        append_debug_message("Looks like you are running a very old set of fw, assuming that it needs an update.")
     else:
-        component = fw_bundle_version.running[0]
-        if component > manifest.bundle_version[0]:
-            if allow_major_downgrades:
-                append_debug_message(
-                    f"Detected major version downgrade from {fw_bundle_version.running} to {manifest.bundle_version}, "
-                    "but major downgrades are allowed so we are proceeding",
-                    progress=10
-                )
-            else:
+        running_major = running_version[0]
+        manifest_major = manifest_version[0]
+
+        if running_major > manifest_major:
+            if not allow_major_downgrades:
                 raise TTError(
-                    f"Detected major version downgrade from {fw_bundle_version.running} to {manifest.bundle_version}, this is not supported. "
+                    f"Detected major version downgrade from {running_version} to {manifest_version}, this is not supported. "
                     "If you really want to do this please re-run with --allow-major-downgrades"
                 )
-        if component == manifest.bundle_version[0] - 1:
+            append_debug_message(
+                f"Detected major version downgrade from {running_version} to {manifest_version}, "
+                "but major downgrades are allowed so we are proceeding",
+            )
+        elif running_major == manifest_major - 1:
             # Permit updates across only one major version boundary
             append_debug_message(
-                f"{CConfig.COLOR.YELLOW}Detected major version upgrade from "
-                f"{fw_bundle_version.running} to {manifest.bundle_version}{CConfig.COLOR.ENDC}",
-                progress=10
+                f"{CConfig.COLOR.YELLOW}Detected major version upgrade from {running_version} to {manifest_version}{CConfig.COLOR.ENDC}",
             )
-        elif component != manifest.bundle_version[0]:
-            if force:
-                append_debug_message(
-                    f"Found unexpected bundle version ('{component}'), however you ran with force so we are barreling onwards",
-                    progress=10
-                )
-            else:
+        elif running_major != manifest_major:
+            if not force:
                 raise TTError(
-                    f"Bundle fwId ({manifest.bundle_version[0]}) does not match expected fwId ({component}); {manifest.bundle_version} != {fw_bundle_version.running} "
-                    "bypass with --force"
+                    f"Bundle fwId ({manifest_major}) does not match expected fwId ({running_major}); "
+                    f"{manifest_version} != {running_version} bypass with --force"
                 )
+            append_debug_message(
+                f"Found unexpected bundle version ('{running_major}'), however you ran with force so we are barreling onwards",
+            )
 
-        append_debug_message(
-            f"ROM version is: {fw_bundle_version.running}. tt-flash version is: {manifest.bundle_version}",
-            progress=10
-        )
+        append_debug_message(f"ROM version is: {running_version}.")
+    append_debug_message(f"tt-flash version is: {manifest_version}", progress=10)
 
-    detected_version = True
+    # 2. Record current and updated versions for results printout
+    status_tracker.set_updated_version(str(chip),str(manifest_version))
+    if fw_bundle_version.spi is not None:
+        status_tracker.set_previous_version(str(chip), str(fw_bundle_version.spi))
+    elif running_version is not None:
+        status_tracker.set_previous_version(str(chip), str(running_version))
+
+    # 3. Verify that manifest_version is an upgrade, or continue using force.
     if force:
-        detected_version = False
-        append_debug_message("Forced ROM update requested. ROM will now be updated.")
-        # TODO: Get versions here and run set_versions(...)
-    # Best check is for if we have already flashed the desired fw (or newer fw) to spi
-    elif fw_bundle_version.spi is not None:
-        if fw_bundle_version.spi >= manifest.bundle_version:
-            # Now that we know if the SPI is newer we should check to see if the problem is that we have flashed the correct FW, but are running something too old
-            if fw_bundle_version.running is not None:
-                if fw_bundle_version.running >= manifest.bundle_version:
-                    append_debug_message("ROM does not need to be updated.")
-                    set_versions(str(fw_bundle_version.running), str(manifest.bundle_version))
-                elif fw_bundle_version.running < manifest.bundle_version:
-                    append_debug_message(
-                        "ROM does not need to be updated, while the chip is running old FW the SPI is up to date. You can load the new firmware after a reboot, or in the case of WH a reset. Or skip this check with --force."
-                    )
-                    set_versions(str(fw_bundle_version.spi), "N/A")
-            else:
-                append_debug_message(
-                    "ROM does not need to be updated, cannot detect the running FW version but the SPI is ahead of the firmware you are attempting to flash. You can load the newer firmware after a reboot, or in the case of WH a reset. Or skip this check with --force."
+        append_debug_message("Forced ROM update requested.")
+    elif fw_bundle_version.spi is not None: # The best way to check current FW version is SPI
+        if fw_bundle_version.spi >= manifest_version:
+            # SPI already has desired version or newer, check for running_version mismatch
+            if running_version is not None and running_version >= manifest_version:
+                # TODO: Print skip_flash messages in the table.
+                return skip_flash("ROM does not need to be updated.")
+            elif running_version is not None:
+                return skip_flash(
+                    "ROM does not need to be updated, while the chip is running old FW the SPI is up to date. "
+                    "You can load the new firmware after a reset. Or skip this check with --force.",
                 )
-                set_versions(str(fw_bundle_version.spi), "N/A")
-
-            return FlashStageResult(
-                state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False
-            )
-    # We did not see any spi versions returned... just go by running
-    elif fw_bundle_version.running is not None:
-        if fw_bundle_version.running >= manifest.bundle_version:
-            append_debug_message("ROM does not need to be updated.")
-            set_versions(str(fw_bundle_version.running), str(manifest.bundle_version))
-            return FlashStageResult(
-                state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False
-            )
+            else:
+                return skip_flash(
+                    "ROM does not need to be updated, cannot detect the running FW version but the SPI is ahead of the firmware you are attempting to flash. "
+                    "You can load the newer firmware after a reset. Or skip this check with --force.",
+                )
+    elif running_version is not None: # The second best way to check current FW version is running_version
+        if running_version >= manifest_version:
+            return skip_flash("ROM does not need to be updated.")
     else:
-        detected_version = False
         append_debug_message(
-            "Was not able to fetch current firmware information, assuming that it needs an update",
-            progress=15
+            "Was not able to fetch current firmware information, assuming that it needs an update.",
         )
-        set_versions("N/A", str(manifest.bundle_version))
+    # Passed all the checks, proceed with update
+    append_debug_message("ROM will now be updated.", progress=15)
 
-    if detected_version:
-        append_debug_message("FW bundle version > ROM version. ROM will now be updated.", progress=15)
-        set_versions(str(chip), fw_bundle_version.running, manifest.bundle_version)
-
+    # 4. Extract image and mask data from FW package. Check for missing FW.
     try:
         image = fw_package.extractfile(f"./{boardname}/image.bin")
     except KeyError:
@@ -442,12 +436,7 @@ def flash_chip_stage1(
     boardname_to_display = change_to_public_name(boardname)
     if image is None and mask is None:
         if skip_missing_fw:
-            append_debug_message(
-                f"Could not find flash data for {boardname_to_display} in tarfile"
-            )
-            return FlashStageResult(
-                state=FlashStageResultState.NoFlash, data=None, msg="", can_reset=False
-            )
+            return skip_flash(f"Could not find flash data for {boardname_to_display} in tarfile")
         else:
             raise TTError(
                 f"Could not find flash data for {boardname_to_display} in tarfile"
@@ -461,7 +450,8 @@ def flash_chip_stage1(
             f"Could not find param data for {boardname_to_display} in tarfile; expected to see {boardname}/mask.json"
         )
 
-    # First we verify that the format of mask is valid so we don't partially flash before discovering that the mask is invalid
+    # 5. Create FlashData from image and mask
+    # Verify that the format of mask is valid so we don't partially flash before discovering that the mask is invalid
     mask = json.loads(mask.read())
 
     # Now we load the image and start replacing parameters
@@ -552,6 +542,7 @@ def flash_chip_stage1(
         writes.sort(key=lambda x: x.offset)
 
 
+    # 6. Determine if board can be reset after flashing
     if boardname in ["NEBULA_X1", "NEBULA_X2"]:
         append_debug_message(
             "Board will require reset to complete update, checking if an automatic reset is possible",
@@ -620,7 +611,7 @@ def flash_chip_stage2(
         if status_tracker:
             status_tracker.set_updated(str(chip))
 
-    append_debug_message("Writing new firmware... (this may take up to 1 minute)", progress=25)
+    append_debug_message("Writing new firmware...", progress=25)
 
     perform_write(chip, data.write)
 
@@ -946,7 +937,13 @@ def flash_chip(
 
     append_debug_message(f"{CConfig.COLOR.GREEN}✓ COMPLETE{CConfig.COLOR.ENDC}", progress=100)
 
-    return (wh_interface_to_reset, bh_interface_to_reset, rc, m3_delay, boardname)
+    return FlashResult(
+        needs_reset_wh=wh_interface_to_reset,
+        needs_reset_bh=bh_interface_to_reset,
+        boardname=boardname,
+        m3_delay=m3_delay,
+        rc=rc
+    )
 
 def reset_all_devices(needs_reset_wh, needs_reset_bh, m3_delay, boardnames):
     devices = None

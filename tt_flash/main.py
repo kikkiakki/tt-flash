@@ -334,23 +334,11 @@ def main():
             status_tracker.print_flash_results_table()
             
             # Unpack results from flash operation
-            needs_reset_wh = []
-            needs_reset_bh = []
-            rcs = []
-            m3_delays = []
-            boardnames = []
-            
-            for wh_interface_id, bh_interface_id, rc_val, m3_delay_val, boardname in results:
-                if wh_interface_id is not None:
-                    needs_reset_wh.append(wh_interface_id)
-                if bh_interface_id is not None:
-                    needs_reset_bh.append(bh_interface_id)
-                rcs.append(rc_val)
-                m3_delays.append(m3_delay_val)
-                boardnames.append(boardname)
-            
-            rc = any(rcs)
-            m3_delay = max(m3_delays) if m3_delays else 20
+            needs_reset_wh = [res.needs_reset_wh for res in results if res.needs_reset_wh is not None]
+            needs_reset_bh = [res.needs_reset_bh for res in results if res.needs_reset_bh is not None]
+            boardnames = [res.boardname for res in results]
+            m3_delay = max(res.m3_delay for res in results)
+            rc = any(res.rc for res in results)
 
             if rc != 0 and args.no_reset:
                 print(
