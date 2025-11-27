@@ -1,3 +1,13 @@
+tt-flash (4.0.0) noble; urgency=medium
+
+  [ Petra Alexson ]
+  * Add version_bump_type input parameter to release workflow
+
+  [ Tenstorrent Releases ]
+  * pyproject.toml- updating version to 4.0.0
+
+ -- Tenstorrent Releases <releases@tenstorrent.com>  Thu, 27 Nov 2025 18:52:00 +0000
+
 tt-flash (3.4.10) noble; urgency=medium
 
   [ Petra Alexson ]
